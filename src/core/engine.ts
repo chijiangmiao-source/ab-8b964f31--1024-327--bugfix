@@ -85,11 +85,16 @@ function minimizeOr(children: Mask[][], limit: number): Mask[] {
  * 大小 ≤s 的极小割集已经全部确定，保留集此后只增不减，
  * 此时越过上限即为门最终族的真实超限。
  */
+function famUnion(fam: Mask[]): Mask {
+  return fam.reduce((u, m) => u | m, 0);
+}
+
 function minimizeAnd(children: Mask[][], limit: number): Mask[] {
   if (children.length === 1) return children[0];
 
   // 分支数少的子门先展开，尽早用极小割集剪枝后续分支。
-  const fams = [...children].sort((a, b) => a.length - b.length);
+  // 第二键按位并集排序仅为确定性：AND 可交换，结论必须与门定义行序无关。
+  const fams = [...children].sort((a, b) => a.length - b.length || famUnion(a) - famUnion(b));
   const k = fams.length;
   const kept: Mask[] = [];
   const keptSet = new Set<Mask>();
@@ -98,49 +103,32 @@ function minimizeAnd(children: Mask[][], limit: number): Mask[] {
   // 最终并集基数的下界：每个子门至少贡献其最小割集的位数。
   const minSize = fams.reduce((acc, fam) => Math.max(acc, Math.min(...fam.map(bitCount))), 0);
   // 上界：所有候选位的并集（实际枚举不会超过它）。
-  const maxSize = bitCount(fams.reduce((acc, fam) => acc | fam.reduce((u, m) => u | m, 0), 0));
-  const suffixPossible = new Array<number>(k + 1).fill(0);
-  for (let i = k - 1; i >= 0; i -= 1) {
-    suffixPossible[i] = suffixPossible[i + 1] | fams[i].reduce((u, m) => u | m, 0);
-  }
+  const maxSize = bitCount(fams.reduce((acc, fam) => acc | famUnion(fam), 0));
+
+  const KEY_BASE = 2 ** 30;
 
   for (let size = minSize; size <= maxSize; size += 1) {
     candidates.clear();
-    // (子门序号, 当前并集) 去重，避免等价路径指数重复。
+    // (子门序号, 当前并集) 精确去重，避免等价路径指数重复。
+    // 后续展开完全由 (idx, union) 决定，同状态访问两次结果一致。
     const visited = new Set<number>();
-    const visitsByDepth = new Map<number, number>();
-    const projectedByDepth = new Map<number, Set<number>>();
-    const KEY_BASE = 2 ** 30;
-
-    const enterState = (idx: number, union: Mask): boolean => {
-      const key = idx * KEY_BASE + union;
-      if (visited.has(key)) return false;
-      visited.add(key);
-
-      const visits = visitsByDepth.get(idx) ?? 0;
-      visitsByDepth.set(idx, visits + 1);
-      if (visits < 64 || idx === k) return true;
-
-      let projected = projectedByDepth.get(idx);
-      if (!projected) {
-        projected = new Set<number>();
-        projectedByDepth.set(idx, projected);
-      }
-      const fixed = union & ~suffixPossible[idx];
-      if (projected.has(fixed)) return false;
-      projected.add(fixed);
-      return true;
-    };
 
     const dfs = (idx: number, union: Mask): void => {
       if (bitCount(union) > size) return;
       // 已含更小的极小割集：后续并集只会更大，整条分支被吸收。
       if (keptHasSubset(union, kept, keptSet)) return;
-      if (!enterState(idx, union)) return;
+
+      const key = idx * KEY_BASE + union;
+      if (visited.has(key)) return;
+      visited.add(key);
 
       if (idx === k) {
-        if (bitCount(union) === size && !keptHasSubset(union, kept, keptSet)) {
+        // 同基数候选互不为真子集；kept 在本层枚举期间不变，入队即可。
+        if (bitCount(union) === size) {
           candidates.add(union);
+          // 同层候选基数相同、彼此不可吸收，均属最终族；
+          // 一旦累计越限即可终止，避免在真正超限时继续指数枚举。
+          if (kept.length + candidates.size > limit) throw new LimitHit('', 0);
         }
         return;
       }

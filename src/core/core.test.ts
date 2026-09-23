@@ -261,6 +261,126 @@ describe('complexity limit', () => {
   });
 });
 
+describe('八组双事件审计树（1024 = 8 × 2^7 个九事件割集）', () => {
+  // ORi = Ai ∨ Bi；ANDi = Ai ∧ Bi；BOTH = OR 八个 ANDi；
+  // TOP = AND(OR0..OR7, BOTH)。
+  // 每个极小割集恰含 9 个事件：某一组 A、B 同时在，其余七组各选一个。
+  const GROUPS = 8;
+  const eventNames = [
+    ...Array.from({ length: GROUPS }, (_, i) => `A${i}`),
+    ...Array.from({ length: GROUPS }, (_, i) => `B${i}`)
+  ];
+
+  type GateLine = { name: string; type: 'AND' | 'OR'; inputs: string[] };
+
+  function gateLines(): GateLine[] {
+    const lines: GateLine[] = [];
+    for (let i = 0; i < GROUPS; i += 1) {
+      lines.push({ name: `OR${i}`, type: 'OR', inputs: [`A${i}`, `B${i}`] });
+      lines.push({ name: `AND${i}`, type: 'AND', inputs: [`A${i}`, `B${i}`] });
+    }
+    lines.push({
+      name: 'BOTH',
+      type: 'OR',
+      inputs: Array.from({ length: GROUPS }, (_, i) => `AND${i}`)
+    });
+    lines.push({
+      name: 'TOP',
+      type: 'AND',
+      inputs: [...Array.from({ length: GROUPS }, (_, i) => `OR${i}`), 'BOTH']
+    });
+    return lines;
+  }
+
+  function toModel(ordered: GateLine[]): ParsedModel {
+    return {
+      events: eventNames,
+      gates: ordered.map((l, i) => ({ ...l, line: i + 1 })),
+      top: 'TOP'
+    };
+  }
+
+  /** 枚举全部期望割集：双现组 d 取 {Ad,Bd}，其余组各取 A 或 B。 */
+  function expectedCutsets(): Set<string> {
+    const expected = new Set<string>();
+    for (let d = 0; d < GROUPS; d += 1) {
+      for (let mask = 0; mask < 1 << (GROUPS - 1); mask += 1) {
+        const pick: string[] = [];
+        for (let g = 0; g < GROUPS; g += 1) {
+          if (g === d) {
+            pick.push(`A${g}`, `B${g}`);
+          } else {
+            const bit = (mask >> (g > d ? g - 1 : g)) & 1;
+            pick.push(bit ? `B${g}` : `A${g}`);
+          }
+        }
+        expected.add(pick.sort().join('·'));
+      }
+    }
+    return expected;
+  }
+
+  const orderings: Record<string, GateLine[]> = {
+    原始顺序: gateLines(),
+    全部逆序: [...gateLines()].reverse(),
+    // 顶门与汇总门提到最前（子门前向引用），双事件门与单组门交错。
+    顶门前置: [
+      gateLines()[gateLines().length - 1],
+      gateLines()[gateLines().length - 2],
+      ...gateLines().slice(0, -2)
+    ],
+    确定性交错: (() => {
+      const src = gateLines();
+      const shuffled: GateLine[] = [];
+      for (let i = 0; i < src.length - 2; i += 2) shuffled.push(src[i + 1], src[i]);
+      shuffled.push(src[src.length - 2], src[src.length - 1]);
+      return shuffled;
+    })()
+  };
+
+  for (const [label, ordered] of Object.entries(orderings)) {
+    it(`门定义${label}：完整返回 1024 个唯一极小割集`, () => {
+      const r = analyze(toModel(ordered));
+      expect(r.status).toBe('complete');
+      if (r.status !== 'complete') return;
+
+      expect(r.cutsets).toHaveLength(8 * 2 ** 7);
+      const joined = r.cutsets.map((c) => c.join('·'));
+      expect(new Set(joined).size).toBe(joined.length);
+      expect(new Set(joined)).toEqual(expectedCutsets());
+
+      // 九事件结构：每组至少贡献一个事件，且恰有一组 A、B 同时出现。
+      for (const cs of r.cutsets) {
+        expect(cs).toHaveLength(9);
+        const set = new Set(cs);
+        let doubleGroups = 0;
+        for (let g = 0; g < GROUPS; g += 1) {
+          const hasA = set.has(`A${g}`);
+          const hasB = set.has(`B${g}`);
+          expect(hasA || hasB).toBe(true);
+          if (hasA && hasB) doubleGroups += 1;
+        }
+        expect(doubleGroups).toBe(1);
+      }
+    });
+
+    it(`门定义${label}：16 个基本事件全部可选，各门割集计数正确`, () => {
+      const r = analyze(toModel(ordered));
+      expect(r.status).toBe('complete');
+      if (r.status !== 'complete') return;
+
+      for (let i = 0; i < GROUPS; i += 1) {
+        expect(r.classification[`A${i}`]).toBe('optional');
+        expect(r.classification[`B${i}`]).toBe('optional');
+        expect(r.gateCounts[`OR${i}`]).toBe(2);
+        expect(r.gateCounts[`AND${i}`]).toBe(1);
+      }
+      expect(r.gateCounts.BOTH).toBe(8);
+      expect(r.gateCounts.TOP).toBe(1024);
+    });
+  }
+});
+
 describe('pipeline 集成（航天器供电示例）', () => {
   const EVENTS = `BUS_FAULT\nMAIN_SRC\nMAIN_SW\nBK_SRC\nBK_SW\nCOMMON_CTRL\nCOSMIC\n`;
   const GATES =
