@@ -32,14 +32,19 @@ function setNative(el: Element, value: string): void {
 }
 
 describe('App 页面', () => {
-  it('渲染示例并显示 8 个割集与“无关”分类', () => {
+  it('渲染示例并显示 1024 个割集与 16 个“可选”事件', () => {
     const { container } = render();
     const heading = container.textContent ?? '';
-    expect(heading).toContain('最小割集（8 个）');
-    expect(heading).toContain('无关');
-    expect(heading).toContain('COSMIC');
-    // 共享门计数表
-    expect(heading).toContain('LOSS');
+    expect(heading).toContain('最小割集（1024 个）');
+    expect(heading).toContain('可选');
+    expect(heading).toContain('A0');
+    expect(heading).toContain('B7');
+    // 16 个事件全部可选：不存在“必现”事件
+    const mandatoryRow = heading.match(/必现[^—]*?(?=可选)/s);
+    expect(mandatoryRow === null || mandatoryRow[0].includes('—')).toBe(true);
+    // 汇总门与单组门计数表
+    expect(heading).toContain('SUM');
+    expect(heading).toContain('O0');
   });
 
   it('保留非法输入并显示可点击的问题定位', () => {

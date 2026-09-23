@@ -80,63 +80,87 @@ function minimizeOr(children: Mask[][], limit: number): Mask[] {
  *
  * 不能按输入逐个折叠并在中间结果上判上限——后续合取支可能使族大幅坍缩
  * （例如 2187 个组合再与“全部事件”单割集相与，最终只剩 1 个）。
- * 这里对全部子门做组合枚举，并按最终并集的基数 s 从小到大处理：
- * 基数更大的候选不可能吸收更小的候选，所以处理完 s 后，
- * 大小 ≤s 的极小割集已经全部确定，保留集此后只增不减，
- * 此时越过上限即为门最终族的真实超限。
+ *
+ * 这里按最终并集基数 s 从小到大做组合 DFS：基数更大的候选不可能吸收更小的
+ * 候选，因此处理完 s 后，大小 ≤s 的极小割集已全部确定，保留集此后只增不减，
+ * 越过上限即可靠地判定为门最终族的真实超限。
+ *
+ * 正确性要点：
+ *  - 同一 (子门序号, 当前并集) 的后续可选分支完全相同，可按精确状态去重；
+ *    但绝不能把“前缀已出现、后缀可能位中也存在”的位当作已定局位——后缀的
+ *    某次取值可以不覆盖它，投影去重会错误删除这类合法分支。
+ *  - minAchievable 给出从某状态出发可达的最小最终基数（精确值），用于在给定
+ *    目标基数 s 时剪枝，并经记忆化在各基数轮与各状态间复用。
  */
 function minimizeAnd(children: Mask[][], limit: number): Mask[] {
   if (children.length === 1) return children[0];
+  // 防御：合法模型里门至少有一个输入，归一化族不可能为空。
+  const fams = children
+    .filter((fam) => fam.length > 0)
+    .map((fam) => [...fam].sort((a, b) => bitCount(a) - bitCount(b)))
+    // 分支数少的子门先展开，尽早用极小割集与定界剪枝后续分支；
+    // 排序只影响性能，使结果与门定义/输入书写顺序无关。
+    .sort((a, b) => a.length - b.length);
+  if (fams.length === 0) return [];
+  if (fams.length === 1) return fams[0];
 
-  // 分支数少的子门先展开，尽早用极小割集剪枝后续分支。
-  const fams = [...children].sort((a, b) => a.length - b.length);
   const k = fams.length;
   const kept: Mask[] = [];
   const keptSet = new Set<Mask>();
-  const candidates = new Set<Mask>();
 
-  // 最终并集基数的下界：每个子门至少贡献其最小割集的位数。
-  const minSize = fams.reduce((acc, fam) => Math.max(acc, Math.min(...fam.map(bitCount))), 0);
-  // 上界：所有候选位的并集（实际枚举不会超过它）。
-  const maxSize = bitCount(fams.reduce((acc, fam) => acc | fam.reduce((u, m) => u | m, 0), 0));
+  // 后缀所有取值的位并集，仅用于推算最终基数上界。
   const suffixPossible = new Array<number>(k + 1).fill(0);
   for (let i = k - 1; i >= 0; i -= 1) {
     suffixPossible[i] = suffixPossible[i + 1] | fams[i].reduce((u, m) => u | m, 0);
   }
+  const maxSize = bitCount(suffixPossible[0]);
 
-  for (let size = minSize; size <= maxSize; size += 1) {
-    candidates.clear();
-    // (子门序号, 当前并集) 去重，避免等价路径指数重复。
-    const visited = new Set<number>();
-    const visitsByDepth = new Map<number, number>();
-    const projectedByDepth = new Map<number, Set<number>>();
-    const KEY_BASE = 2 ** 30;
+  // key = idx * 2^30 + union；idx ≤ 门输入数（≤80），union < 2^30，
+  // 远小于 2^53，键值互不重叠且为安全整数。
+  const KEY_BASE = 2 ** 30;
+  // 仅缓存“在某 cutoff 之下求得的精确最小值”；值 ≥cutoff 时只代表下界，不缓存。
+  const minMemo = new Map<number, number>();
 
-    const enterState = (idx: number, union: Mask): boolean => {
-      const key = idx * KEY_BASE + union;
-      if (visited.has(key)) return false;
-      visited.add(key);
+  /**
+   * 从 (idx, union) 出发可达的最小最终基数；若该最小值 ≥ cutoff 可直接返回 cutoff。
+   * 并集基数单调不减，故分支定界不会低估：初始 cutoff 取不可达上界时即为精确值。
+   */
+  const minAchievable = (idx: number, union: Mask, cutoff: number): number => {
+    if (bitCount(union) >= cutoff) return cutoff;
+    if (idx === k) return bitCount(union);
+    const key = idx * KEY_BASE + union;
+    const cached = minMemo.get(key);
+    if (cached !== undefined) return cached >= cutoff ? cutoff : cached;
 
-      const visits = visitsByDepth.get(idx) ?? 0;
-      visitsByDepth.set(idx, visits + 1);
-      if (visits < 64 || idx === k) return true;
-
-      let projected = projectedByDepth.get(idx);
-      if (!projected) {
-        projected = new Set<number>();
-        projectedByDepth.set(idx, projected);
+    let best = cutoff;
+    for (const part of fams[idx]) {
+      const v = minAchievable(idx + 1, union | part, best);
+      if (v < best) {
+        best = v;
+        // 基数不可能低于当前并集基数，已达理论最优。
+        if (best === bitCount(union)) break;
       }
-      const fixed = union & ~suffixPossible[idx];
-      if (projected.has(fixed)) return false;
-      projected.add(fixed);
-      return true;
-    };
+    }
+    if (best < cutoff) minMemo.set(key, best);
+    return best;
+  };
+
+  const globalMin = minAchievable(0, 0, maxSize + 1);
+  for (let size = globalMin; size <= maxSize; size += 1) {
+    const candidates = new Set<Mask>();
+    // 仅按精确 (序号, 并集) 去重，避免等价路径指数重复。
+    const visited = new Set<number>();
 
     const dfs = (idx: number, union: Mask): void => {
-      if (bitCount(union) > size) return;
       // 已含更小的极小割集：后续并集只会更大，整条分支被吸收。
       if (keptHasSubset(union, kept, keptSet)) return;
-      if (!enterState(idx, union)) return;
+      if (bitCount(union) > size) return;
+      // 该状态下最优可能仍超过目标基数：本轮无解。
+      if (minAchievable(idx, union, size + 1) > size) return;
+
+      const key = idx * KEY_BASE + union;
+      if (visited.has(key)) return;
+      visited.add(key);
 
       if (idx === k) {
         if (bitCount(union) === size && !keptHasSubset(union, kept, keptSet)) {

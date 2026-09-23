@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { analyze, MAX_CUTSETS_PER_GATE } from './engine';
 import { parseEvents, parseGates, parseModel, parseTop } from './parser';
 import { audit } from './pipeline';
-import type { ParsedModel } from './types';
+import type { Analysis, ParsedModel } from './types';
 import { findCycles, validate } from './validate';
 
 function model(events: string[], lines: string[], top: string): ParsedModel {
@@ -257,6 +257,116 @@ describe('complexity limit', () => {
       expect(r.gate).toBe('TOP');
       expect(r.partialGateCounts.A).toBe(2000);
       expect(r.partialGateCounts.B).toBe(2);
+    }
+  });
+});
+
+describe('八组双元基本事件（A0/B0 … A7/B7）', () => {
+  type GateLine = { name: string; type: 'AND' | 'OR'; inputs: string[] };
+
+  function eightPairLines(): GateLine[] {
+    const lines: GateLine[] = [];
+    for (let i = 0; i < 8; i += 1) lines.push({ name: `O${i}`, type: 'OR', inputs: [`A${i}`, `B${i}`] });
+    for (let i = 0; i < 8; i += 1) lines.push({ name: `D${i}`, type: 'AND', inputs: [`A${i}`, `B${i}`] });
+    lines.push({
+      name: 'SUM',
+      type: 'OR',
+      inputs: Array.from({ length: 8 }, (_, i) => `D${i}`)
+    });
+    lines.push({
+      name: 'TOP',
+      type: 'AND',
+      inputs: [...Array.from({ length: 8 }, (_, i) => `O${i}`), 'SUM']
+    });
+    return lines;
+  }
+
+  const pairEvents = (): string[] =>
+    Array.from({ length: 8 }, (_, i) => [`A${i}`, `B${i}`]).flat();
+
+  function fromLines(ordered: GateLine[]): ParsedModel {
+    return {
+      events: pairEvents(),
+      gates: ordered.map((g, i) => ({ ...g, line: i + 1 })),
+      top: 'TOP'
+    };
+  }
+
+  /** 校验：1024 个互不相同的九事件割集，恰一组含 A、B，其余七组各取一个。 */
+  function expectCorrectFamily(r: Extract<Analysis, { status: 'complete' }>): void {
+    expect(r.cutsets).toHaveLength(1024);
+
+    // 唯一性：以排序后的事件元组去重
+    const keys = new Set(r.cutsets.map((c) => [...c].sort().join('·')));
+    expect(keys.size).toBe(1024);
+
+    for (const cs of r.cutsets) {
+      expect(cs).toHaveLength(9);
+      const set = new Set(cs);
+      expect(set.size).toBe(9);
+      // 逐组核对：恰有一组两个都在，其余恰有一个
+      let doubleGroups = 0;
+      for (let i = 0; i < 8; i += 1) {
+        const hasA = set.has(`A${i}`);
+        const hasB = set.has(`B${i}`);
+        if (hasA && hasB) doubleGroups += 1;
+        else expect(hasA || hasB).toBe(true);
+      }
+      expect(doubleGroups).toBe(1);
+    }
+  }
+
+  function expectCorrectCounts(r: Extract<Analysis, { status: 'complete' }>): void {
+    for (let i = 0; i < 8; i += 1) {
+      expect(r.gateCounts[`O${i}`]).toBe(2);
+      expect(r.gateCounts[`D${i}`]).toBe(1);
+    }
+    expect(r.gateCounts.SUM).toBe(8);
+    expect(r.gateCounts.TOP).toBe(1024);
+  }
+
+  it('顶门 8×2^7 = 1024 个九事件割集，16 个事件全部可选', () => {
+    const r = analyze(fromLines(eightPairLines()));
+    expect(r.status).toBe('complete');
+    if (r.status !== 'complete') return;
+    expectCorrectFamily(r);
+    expectCorrectCounts(r);
+    for (let i = 0; i < 8; i += 1) {
+      expect(r.classification[`A${i}`]).toBe('optional');
+      expect(r.classification[`B${i}`]).toBe('optional');
+    }
+    // 不存在必现事件（曾错误地把 A0 归为必现）
+    expect(Object.values(r.classification)).not.toContain('mandatory');
+  });
+
+  it('门定义行顺序变化不改变结论：倒置 / 顶门置首 / 交错重排', () => {
+    const base = eightPairLines();
+    const top = base[base.length - 1];
+    const sum = base[base.length - 2];
+    const ors = base.slice(0, 8);
+    const ands = base.slice(8, 16);
+
+    const variants: GateLine[][] = [
+      [...base].reverse(),
+      [top, ...base.slice(0, -1)],
+      // 交错：顶门、汇总、OR/AND 交替，子门在被引用之后定义
+      [
+        top,
+        sum,
+        ...Array.from({ length: 8 }, (_, i) => [ands[i], ors[i]]).flat()
+      ]
+    ];
+
+    const reference = analyze(fromLines(base));
+    expect(reference.status).toBe('complete');
+    for (const variant of variants) {
+      const r = analyze(fromLines(variant));
+      expect(r.status).toBe('complete');
+      if (r.status !== 'complete' || reference.status !== 'complete') continue;
+      expectCorrectFamily(r);
+      expectCorrectCounts(r);
+      expect(r.classification).toEqual(reference.classification);
+      expect(r.cutsets).toEqual(reference.cutsets);
     }
   });
 });
